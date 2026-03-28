@@ -4,7 +4,9 @@
 
 ---
 
-The Unitree G1 is a $16,000 humanoid robot with 29 degrees of freedom. Out of the box, it walks. It waves. It streams sensor data. What it cannot do is see objects, navigate to them, understand speech, or learn new tasks. Between September and November 2025, I built the software that adds those capabilities.
+You don't build a humanoid robot operating system because it's a good career move. You build it because you're standing in front of a machine with 29 degrees of freedom that can't do a single useful thing on its own, and you think: I can fix that.
+
+The Unitree G1 is a $16,000 humanoid robot. Out of the box, it walks. It waves. It streams sensor data. What it cannot do is see objects, navigate to them, understand speech, or learn new tasks. Between September 2025 and March 2026, I built the software that adds those capabilities — a full-stack system called Robot-OS that gives the G1 perception, navigation, voice interaction, and learned manipulation, coordinated through a single architecture running across two machines connected by WiFi.
 
 This is a description of that system: what it does, how the pieces fit together, and the parts that took longer than they should have.
 
@@ -14,25 +16,58 @@ The G1 runs a reinforcement-learning locomotion policy on its firmware. This han
 
 The locomotion policy is good. I never had to touch it. Everything I built sits on top of it.
 
+## Why not ROS?
+
+Most robotics labs build systems by stitching together ROS nodes — one for perception, one for navigation, one for planning — communicating through a publish-subscribe mesh. It's powerful and well-tested. It's also brittle in ways that matter when you're building a system that needs to coordinate voice, vision, navigation, and manipulation in real time.
+
+When something goes wrong in a ROS graph (and it always does), you're debugging message flows across a dozen processes with no central authority. A perception node publishes stale object positions. A navigation node plans a path to where the object was three seconds ago. A manipulation node reaches for empty space. Each node works. The system doesn't.
+
+I wanted a monolithic backend where every service lives under one process, shares state directly, and can be orchestrated through a single state machine. Not because monoliths are trendy, but because when your robot is about to walk into a wall, you need the navigation service to know about it *now*, not after a message round-trip through a serialization layer.
+
+The one exception is the navigation stack itself, which runs ROS2 inside a Docker container on the Jetson. That's the only piece of the system that uses ROS, and it's isolated precisely because the ROS2 dependency tree is large enough to justify containment.
+
 ## The architecture
 
-The system spans two machines. The Jetson inside the robot handles sensor relay and navigation. A workstation across the room handles everything else: the web frontend, the backend services, perception inference, voice processing, and policy training. They communicate over WiFi.
+The system spans two machines. The Jetson inside the robot handles sensor relay and navigation. A workstation across the room handles everything else: the web frontend, the backend services, perception inference, voice processing, and policy execution. They communicate over WiFi.
 
-This split exists because the Jetson doesn't have the compute to run SAM3, FoundationPose, and a voice model simultaneously. It also exists because the robot's internal communication bus is unreachable from outside.
+This split exists for two reasons. First, the Jetson doesn't have the compute to run SAM3, FoundationPose, and a voice model simultaneously — those are GPU-hungry inference workloads that need a proper workstation GPU. Second, and more fundamentally, the robot's internal communication bus is unreachable from outside.
 
 ![System Architecture](architecture.png)
 
-The G1's motors and sensors sit on a DDS bus locked to a 192.168.123.x subnet. This subnet is only accessible from the Jetson's internal network interface. The workstation lives on a different subnet (192.168.0.x), reachable over WiFi. I spent a day trying to bridge these with iptables rules and IP forwarding on the Jetson. It doesn't work. The DDS implementation embeds the sender's IP in the protocol payload, so messages from the wrong subnet get silently dropped.
+### The DDS subnet problem
 
-The solution is relay processes. Five small Python scripts run on the Jetson, each bridging one data stream between the DDS bus and a WebSocket or HTTP endpoint the workstation can reach:
+The G1's motors and sensors sit on a DDS (Data Distribution Service) bus locked to a 192.168.123.x subnet. This subnet is only accessible from the Jetson's internal ethernet interface — it's the physical bus that connects to the motor controllers, IMU, and LiDAR inside the robot's body. The workstation lives on a different subnet (192.168.0.x), reachable over WiFi.
 
-- **Arm command relay**: receives joint targets from the workstation, publishes to `rt/arm_sdk` at 250 Hz
-- **Camera relay**: captures frames from the RealSense D435, streams them over WebSocket
-- **Lowstate relay**: reads joint positions off the DDS bus, forwards them at 30 Hz
-- **Velocity command executor**: receives navigation velocity commands, calls the Unitree SDK's `Move()` function
-- **Motion proxy**: receives gesture trigger requests over HTTP, dispatches them to the firmware
+The obvious approach is IP forwarding: configure the Jetson as a gateway, route packets from the WiFi subnet to the internal bus, done. I spent a day on this. It doesn't work. The DDS implementation (Cyclone DDS, used by Unitree) embeds the sender's IP address in the protocol payload itself. Messages originating from the wrong subnet get silently dropped by the DDS discovery mechanism, even if they're correctly routed at the IP level. This isn't a misconfiguration — it's a fundamental property of how DDS peer discovery works.
 
-This is not elegant, but it works, and it made the rest of the system possible. Each relay is independent. If the camera relay crashes, navigation still works. If the arm relay is down, the voice agent can still dispatch gestures through the motion proxy.
+### Relay processes
+
+The solution is relay processes. Five small Python scripts run on the Jetson host (outside Docker), each bridging one data stream between the DDS bus and a WebSocket or HTTP endpoint the workstation can reach:
+
+- **Arm command relay** (port 8097): receives joint position targets from the workstation over WebSocket, publishes them to the `rt/arm_sdk` DDS topic at 250 Hz. This is the critical path for teleoperation and policy execution — any latency here means the robot's arm lags behind the commanded position.
+
+- **Camera relay** (port 8090): captures RGB-D frames from the RealSense D435, JPEG-encodes RGB, base64-encodes depth, and streams both over WebSocket. The workstation's perception pipeline consumes these frames for object detection and pose estimation.
+
+- **Lowstate relay** (port 8096): reads the full joint state (35 motor positions, velocities, and torques) off the DDS bus via raw multicast, and forwards them at 30 Hz over WebSocket. This feeds the Rerun visualization (live URDF rendering) and provides the observation input for ACT policy inference.
+
+- **Velocity command executor** (port 9002, via nav stack): receives `cmd_vel` navigation commands from the ROS2 path follower inside the Docker container, and calls the Unitree SDK's `Move()` function to actually make the robot walk. Without this bridge, the navigation stack can plan paths but the robot won't move.
+
+- **Motion proxy** (port 8095): receives gesture trigger requests over HTTP REST, dispatches them to the firmware's gesture system via the `G1ArmActionClient` DDS interface. This is the simplest relay — fire and forget — but it's separated because gesture execution runs at firmware level with full motor authority, distinct from the `arm_sdk` overlay.
+
+Each relay is independent. If the camera relay crashes, navigation still works. If the arm relay is down, the voice agent can still dispatch gestures through the motion proxy. This fault isolation wasn't a design goal — it fell out of the architecture naturally — but it turned out to be one of the system's best properties.
+
+### The workstation stack
+
+On the workstation side, a single FastAPI process hosts all services:
+
+- **Perception services**: SAM3 segmentation, FoundationPose 6DoF pose estimation, and CLIP embedding — each running in separate conda environments as HTTP microservices, called by the main backend.
+- **Spatial memory**: a persistent 3D object database indexed by position and semantic embedding.
+- **Voice service**: OpenAI Realtime API integration with wake word detection ("Hey Tyson" — the original project name), running in its own Python environment with a WebSocket relay to the backend.
+- **Teleop server**: HTTPS WebSocket server for VR headset connections, processing controller poses through IK.
+- **ACT skill runner**: loads trained policies and runs inference at 50 Hz, sending joint targets through the arm relay.
+- **Navigation bridge**: receives pointcloud and pose data from the Jetson's nav stack, forwards navigation goals, and streams visualization data to Rerun.
+
+A React frontend provides monitoring and control: live camera feeds, a 2D navigation map with waypoint placement, gesture triggers, voice controls, and sensor readouts. Rerun renders a 3D view with the robot's URDF model at its estimated position, overlaid on the accumulated LiDAR pointcloud.
 
 ## The arm control interface nobody documented
 
@@ -66,6 +101,8 @@ The perception pipeline detects objects in the camera feed, estimates their 3D p
 
 **CLIP** encodes each detection as a vector embedding, stored alongside the object's map position. This enables text search from the frontend: type "red mug" and the system highlights the closest match.
 
+Getting FoundationPose to work within the resource constraints of a single workstation GPU was its own problem. The model wants to eat VRAM for breakfast. I ended up implementing sequential object processing with aggressive memory management — it takes longer per object, but it doesn't crash, and for a robot that processes a scene once before acting, latency per object matters less than robustness.
+
 The pipeline has two unsolved problems:
 
 **Deduplication.** The same mug seen from three angles creates three separate entries. Merging detections across viewpoints requires matching by position and appearance, and the thresholds that work for large objects fail for small ones.
@@ -78,21 +115,29 @@ These reflect a real gap between single-image detection — which current models
 
 ## Navigation
 
-Autonomous navigation uses a ROS2 stack developed by the team at Dimensional, running in a Docker container on the Jetson. It fuses LiDAR scans with IMU data for SLAM, computes costmaps, plans paths, and outputs velocity commands.
+Autonomous navigation uses a ROS2 stack running in a Docker container on the Jetson. It fuses LiDAR scans with IMU data for SLAM, computes costmaps, plans paths, and outputs velocity commands.
 
-Two WebSocket channels connect the nav stack to the workstation: one for visualization data (point cloud, pose, planned path) and one for velocity commands that the cmd_vel executor forwards to the robot's `Move()` function.
+Two WebSocket channels connect the nav stack to the workstation: one for visualization data (point cloud, robot pose, planned path) and one for velocity commands that the executor forwards to the robot's `Move()` function.
 
-The nav stack runs in Docker because that's how Dimensional packaged it, and the ROS2 dependency tree is large enough that isolating it makes sense. Nothing else in the system uses ROS.
+The integration between ROS2's path follower and Unitree's locomotion SDK was non-trivial. The navigation stack outputs `cmd_vel` velocity commands inside the Docker container, but the Unitree SDK can only be called from the Jetson host. The `cmdvel_ws_executor.py` bridge process connects to the container's WebSocket on port 9002, receives velocity commands, and translates them into SDK `Move()` calls. I debugged this chain for an entire weekend before realizing the executor was disabled by a single environment variable (`NAV_EXECUTOR_ENABLED=0`).
+
+The frontend lets you place waypoints on a 2D map, and the robot plans paths to them autonomously, including correct yaw orientation at the destination. The voice agent can also trigger navigation: "Go to the bottle" queries spatial memory for the bottle's position and sends it as a navigation goal.
+
+Visualization bandwidth was a problem. The raw WebSocket broadcast from the nav stack was 6.5 MB per message at 1 Hz — mostly navigation graph and polygon markers that nobody needed. Disabling those fields dropped it to 941 KB at 4 Hz, which made the Rerun pointcloud visualization actually usable.
+
+![Navigation Visualization](navigation.jpg)
 
 ## Voice control
 
 A voice interface connects the robot to OpenAI's Realtime API for speech-to-speech conversation. The robot listens through a USB microphone on the workstation (the Jetson's audio hardware is limited), and the LLM generates both spoken responses and tool calls.
 
-Available tools include: navigate to a location, trigger a gesture, query spatial memory, and activate a manipulation skill. A routine executor can chain these into multi-step plans — "go to the kitchen, find the mug, pick it up" becomes a sequence of navigation goals, perception queries, and skill activations.
+Available tools include: navigate to a location, trigger a gesture, query spatial memory, and activate a manipulation skill. A routine executor can chain these into multi-step plans — "go to the kitchen, find the mug, pick it up" becomes a sequence of navigation goals, perception queries, and skill activations, orchestrated by a state machine that waits for each action to complete before advancing.
 
 Single-step commands work reliably. Multi-step plans compound errors. If perception, navigation, and manipulation each succeed 85% of the time, a three-step chain succeeds 61% of the time. In practice, the rates are often lower. A navigation goal reached 30 cm off target means the subsequent grasp fails, and the planner doesn't know why.
 
 The bottleneck is not the language model. Current LLMs plan well enough for this kind of task. The bottleneck is the state representation they receive. The planner can only act on what the perception system actually detected, which may not reflect what's in the room.
+
+The hardest part of the voice system wasn't the AI. It was the audio infrastructure. ALSA device management on Linux, Bluetooth speaker pairing that breaks on reboot, microphone gain that clips in noisy environments, echo cancellation between the speaker and the mic — the unsexy engineering that makes voice interaction work in a physical space rather than a quiet demo room.
 
 ![Voice Interaction](voice-conversation.jpg)
 
@@ -102,7 +147,7 @@ Before the robot can learn manipulation, it needs training data. Before you can 
 
 The setup: a Pico VR headset streams controller poses over WebSocket to the workstation. An IK solver converts 6-DoF wrist targets into 14-DoF joint angles. These are sent to the Jetson's arm relay, which publishes them to `rt/arm_sdk`.
 
-The IK solver is Pink, a QP-based velocity IK library built on Pinocchio. It replaced a CasADi/IPOPT solver that was in the original codebase. Pink computes incremental velocity steps toward the target rather than re-solving the full nonlinear problem each frame. The difference: 0.5 ms per step vs 5-15 ms, and much less jitter.
+The IK solver is Pink, a QP-based velocity IK library built on Pinocchio. It replaced a CasADi/IPOPT solver that was in the original codebase. Pink computes incremental velocity steps toward the target rather than re-solving the full nonlinear problem each frame. The difference: 0.5 ms per step vs 5-15 ms, and much less jitter. It also supports per-joint posture weights, which keep the robot's arm configuration natural instead of drifting into kinematically valid but physically awkward poses.
 
 A 0.7× workspace scaling maps human arm reach to the robot's shorter arms. Without it, extending your arm to 70% of your reach already pushes the robot to its kinematic limits.
 
@@ -110,7 +155,7 @@ After the IK solver, transforms, and scaling were all working correctly, the arm
 
 I spent twelve hours on this. I replaced the IK solver. Added feed-forward gravity compensation torques. Tuned PD gains. Restructured the coordinate pipeline. Every change was correct. None had any visible effect.
 
-The cause was a velocity clipper buried in the arm relay. The relay's control loop runs at 250 Hz. Each tick, the clipper read the motor's current position and capped how far the commanded position could deviate from it. The intent was smooth motion. The effect was that the PD controller never saw more than a tiny position error, so it never generated more than a fraction of available torque. The arm couldn't overcome gravity because the relay was preventing it from trying.
+The cause was a velocity clipper buried in the arm relay. The relay's control loop runs at 250 Hz. Each tick, the clipper read the motor's current position and capped how far the commanded position could deviate from it — 0.02 radians maximum. The intent was smooth motion. The effect was that the PD controller never saw more than a tiny position error, so it never generated more than a fraction of available torque. The arm couldn't overcome gravity because the relay was preventing it from trying.
 
 I removed the clipper. The arm lifted above the head on the first try.
 
@@ -124,7 +169,7 @@ The recordings convert to LeRobot format for training an ACT (Action Chunking wi
 
 Deployment uses the same arm relay as teleoperation. The skill runner moves the arms to a start pose, then runs inference at 50 Hz: read camera, read joints, predict action chunk, send targets. The policy runs until a termination condition or timeout.
 
-The Dex3 hands deserve a mention. They're mechanically capable but not designed for this kind of abuse. Multiple fingers broke during data collection. When a thumb pin snapped, I measured it, modeled a replacement in CAD, and had a local CNC shop machine new ones. The hands are not designed to be disassembled.
+The Dex3 hands deserve a mention. They're mechanically capable but not designed for this kind of abuse. Multiple fingers broke during data collection. When a thumb pin snapped, I measured it, modeled a replacement in CAD, and had a local CNC shop machine new ones. The hands are not designed to be disassembled. You learn the internals by breaking them.
 
 ## What the system looks like end to end
 
@@ -142,4 +187,4 @@ This isn't a surprising result. It's the expected state of a system where every 
 
 ---
 
-*Pim Van den Bosch is a robotics engineer working on humanoid robot systems, simulation, and whole-body control.*
+*Pim Van den Bosch is a robotics engineer based in Belgium, working on humanoid robot systems, simulation, and whole-body control.*
