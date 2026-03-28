@@ -16,15 +16,29 @@ The G1 runs a reinforcement-learning locomotion policy on its firmware. This han
 
 The locomotion policy is good. I never had to touch it. Everything I built sits on top of it.
 
-## Why not ROS?
+## The architecture, honestly
 
-The standard approach in robotics is to build on ROS — one node per capability, communicating through publish-subscribe. It works. It's also where most of the debugging time goes. When perception publishes stale object positions and navigation plans a path to where the object was three seconds ago, every node is working correctly and the system still fails. The failure mode is in the interfaces, not the components.
+The system is not a monolith and it's not a microservice architecture. It's what happens when you need SAM3, FoundationPose, ROS2, a voice model, and an IK solver to coexist, and they all require incompatible Python environments.
 
-Robot-OS uses a monolithic FastAPI backend instead. Every service — voice, vision, navigation, manipulation — lives under one process and shares state directly. When the perception pipeline updates an object's position, the navigation planner sees it immediately, not after serialization through a message queue. A single state machine can coordinate multi-step tasks (navigate, detect, grasp) without the orchestration layer that ROS systems typically need on top.
+`start_workstation.sh` launches roughly ten processes:
 
-The trade-off is obvious: less modularity, harder to swap components. In practice, for a system where everything is changing constantly and the integration *is* the hard part, having direct function calls between services saved more time than it cost.
+- A **FastAPI backend** (port 8000) that hosts the coordination logic: navigation routing, the routine state machine, voice relay, arm mode switching, and the API endpoints the frontend talks to. This is the closest thing to a "core" — services inside it share state through Python singletons and asyncio events.
+- **Spatial memory** (port 8090) — a separate FastAPI app with its own conda environment, responsible for storing and querying detected objects. The main backend talks to it over HTTP.
+- **SAM3** (port 8091), **SAM3D** (port 8092), **FoundationPose** (port 8093) — each a separate process in its own conda environment, each called by the spatial memory service over HTTP.
+- **ACT skill runner** (port 8098) — runs learned manipulation policies in the `unitree_lerobot` conda environment.
+- **XR teleop server** (port 8012) — HTTPS WebSocket server for VR headset connections, runs Pink IK in the `teleop` conda environment.
+- **Nav→Rerun bridge**, **joint state visualizer** — separate processes that stream data to the Rerun 3D viewer.
+- **React frontend** (port 5173).
 
-The one exception is the navigation stack itself, which runs ROS2 inside a Docker container on the Jetson — the only piece of the system that uses ROS, isolated because the dependency tree is large enough to justify containment.
+The reason for this fragmentation is entirely practical: SAM3 needs PyTorch with specific CUDA versions, FoundationPose needs a different set of dependencies, the voice model runtime requires Python 3.9, and Pink IK needs Pinocchio which conflicts with half the perception stack. Conda environments can't be shared. So each capability runs in its own process, and they talk over HTTP and WebSocket on localhost.
+
+What makes this different from a typical ROS graph is where the coordination lives. In ROS, multi-step tasks (navigate → detect → grasp) require an orchestration layer on top of the message bus. In Robot-OS, the routine executor is a Python state machine inside the FastAPI backend that dispatches steps sequentially: it sends a WebSocket message to the Jetson nav stack for navigation, makes an HTTP POST to the motion proxy for gestures, and calls the voice service API for speech — then waits for completion events before advancing. The state machine, the waiting logic, and the error handling are all in one file (`routine_executor.py`), not spread across a node graph.
+
+The voice agent works the same way. When you say "go to the red cup," the LLM generates a tool call. The `action_executor.py` in the voice service makes an HTTP GET to `http://127.0.0.1:8000/spatial-memory/search/objects?query=red+cup`, gets back coordinates, and POSTs a navigation goal to the backend's `/navigation/goto` endpoint. It's HTTP calls, not shared memory. But the control flow is explicit and sequential — you can read it top to bottom — which made debugging significantly easier than chasing messages through a pub-sub graph.
+
+The trade-off is real: swapping out the perception backend means changing HTTP endpoints and response formats. There's no standardized message type like ROS provides. But for a system where every component was changing weekly, having the integration logic in readable Python with `httpx` calls was more productive than maintaining message definitions and launch files.
+
+The one piece that uses ROS is the navigation stack, which runs ROS2 inside a Docker container on the Jetson. It's isolated because the ROS2 dependency tree is massive and because the nav stack was originally packaged that way. Nothing else in the system uses ROS.
 
 ## The architecture
 
@@ -58,15 +72,6 @@ Each relay is independent. If the camera relay crashes, navigation still works. 
 
 ### The workstation stack
 
-On the workstation side, a single FastAPI process hosts all services:
-
-- **Perception services**: SAM3 segmentation, FoundationPose 6DoF pose estimation, and CLIP embedding — each running in separate conda environments as HTTP microservices, called by the main backend.
-- **Spatial memory**: a persistent 3D object database indexed by position and semantic embedding.
-- **Voice service**: OpenAI Realtime API integration with wake word detection ("Hey Tyson" — the original project name), running in its own Python environment with a WebSocket relay to the backend.
-- **Teleop server**: HTTPS WebSocket server for VR headset connections, processing controller poses through IK.
-- **ACT skill runner**: loads trained policies and runs inference at 50 Hz, sending joint targets through the arm relay.
-- **Navigation bridge**: receives pointcloud and pose data from the Jetson's nav stack, forwards navigation goals, and streams visualization data to Rerun.
-
 A React frontend provides monitoring and control: live camera feeds, a 2D navigation map with waypoint placement, gesture triggers, voice controls, and sensor readouts. Rerun renders a 3D view with the robot's URDF model at its estimated position, overlaid on the accumulated LiDAR pointcloud.
 
 ## The arm control interface nobody documented
@@ -93,13 +98,11 @@ None of this is in the documentation. None of it is in the GitHub issues. Each d
 
 ## Perception
 
-The perception pipeline detects objects in the camera feed, estimates their 3D pose, and stores them on the SLAM map. Three models work in sequence:
+The perception pipeline detects objects in the camera feed, estimates their 3D pose, and stores them on the SLAM map. It runs as a chain of HTTP calls between four separate processes, each in its own conda environment.
 
-**SAM3** takes an RGB frame and produces segmentation masks and coarse 3D meshes for each detected object. Mesh quality varies. Mugs and bottles reconstruct well. Irregular shapes usually don't.
+The backend captures an RGB-D frame from the camera relay and the robot's current pose from the navigation WebSocket, then POSTs both to the spatial memory service (port 8090). Spatial memory calls SAM3 (port 8091), which returns segmentation masks and coarse 3D meshes. Each mesh and the depth image are forwarded to FoundationPose (port 8093) for 6-DoF pose estimation. CLIP encodes each detection as a vector embedding for text search. The spatial memory service stores everything — object positions, orientations, meshes, embeddings — anchored to the robot's pose at detection time.
 
-**FoundationPose** takes each mesh and a depth image and estimates the object's 6-DoF pose. I first used FoundationPose during an internship at VUB's BruBotics lab. The insight here was that SAM3's mesh output could feed directly into FoundationPose's input, closing the loop from detection to localization without a separate CAD model.
-
-**CLIP** encodes each detection as a vector embedding, stored alongside the object's map position. This enables text search from the frontend: type "red mug" and the system highlights the closest match.
+One detail that made this pipeline possible: SAM3's mesh output feeds directly into FoundationPose's input. Most FoundationPose workflows require pre-scanned CAD models of each object. Using SAM3's coarse reconstruction instead closes the loop from open-vocabulary detection to 6-DoF localization without knowing what the objects are in advance. I first used FoundationPose during an internship at VUB's BruBotics lab, and the realization that it could work with low-quality meshes was what made the whole spatial memory concept feasible.
 
 Getting FoundationPose to work within the resource constraints of a single workstation GPU was its own problem. The model wants to eat VRAM for breakfast. I ended up implementing sequential object processing with aggressive memory management — it takes longer per object, but it doesn't crash, and for a robot that processes a scene once before acting, latency per object matters less than robustness.
 
@@ -179,7 +182,7 @@ This isn't a surprising result. It's the expected state of a system where every 
 
 ## Three things I'd change
 
-**Standardize on containers from the start.** The microservice architecture happened because SAM3, FoundationPose, ROS2, and the voice model all need different Python environments. I solved the conflicts reactively with separate processes and Docker. Designing the communication interfaces first would have saved significant debugging.
+**Define service interfaces before writing services.** The ten-process architecture happened reactively — each new capability got its own process because its dependencies conflicted with everything else. The HTTP interfaces between them were designed after the fact, which means they're inconsistent. Some return JSON with an `ok` field, some don't. Some use WebSocket, some use REST. Defining a contract up front would have saved weeks of integration debugging.
 
 **Build a proper spatial memory layer.** The current system stores object positions at detection time and never updates them. Objects move. The robot moves. A useful spatial inventory needs to track objects over time, merge observations, and handle uncertainty. This is a well-studied problem in robotics. Integrating it with foundation-model detectors is not.
 
