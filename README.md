@@ -4,9 +4,9 @@
 
 ---
 
-The Unitree G1 is a $16,000 humanoid robot with 29 degrees of freedom. Out of the box, it walks. It waves. It streams sensor data. What it cannot do is see objects, navigate to them, understand speech, or learn new tasks. The gap between a robot that balances and a robot that does useful work is enormous, and almost entirely a software problem.
+The Unitree G1 is a $16,000 humanoid robot with 29 degrees of freedom. Out of the box, it walks. It waves. It streams sensor data. What it cannot do is see objects, navigate to them, understand speech, or learn new tasks. The gap between a robot that balances and a robot that does useful work is enormous, and largely a software problem.
 
-Between September 2025 and March 2026, I built Robot-OS — the software that bridges that gap. It gives the G1 perception, autonomous navigation, voice interaction, and learned manipulation, running across two machines connected by WiFi. 198 commits, roughly seven months of evenings and weekends, a lot of broken hardware.
+Between September 2025 and March 2026, I built Robot-OS — the software that bridges that gap. It gives the G1 perception, autonomous navigation, voice interaction, and learned manipulation, running across two machines connected by WiFi. Hundreds of commits, roughly seven months of evenings and weekends, a lot of broken hardware.
 
 This is a description of that system: what it does, how the pieces fit together, and the parts that took longer than they should have.
 
@@ -30,7 +30,7 @@ The system is not a monolith and it's not a microservice architecture. It's what
 - **Nav→Rerun bridge**, **joint state visualizer** — separate processes that stream data to the Rerun 3D viewer.
 - **React frontend** (port 5173).
 
-The reason for this fragmentation is entirely practical: SAM3 needs PyTorch with specific CUDA versions, FoundationPose needs a different set of dependencies, the voice model runtime requires Python 3.9, and Pink IK needs Pinocchio which conflicts with half the perception stack. Conda environments can't be shared. So each capability runs in its own process, and they talk over HTTP and WebSocket on localhost.
+The reason for this fragmentation is entirely practical: SAM3 needs PyTorch with specific CUDA versions, FoundationPose needs a different set of dependencies, the voice runtime has its own version constraints, and Pink IK needs Pinocchio which conflicts with half the perception stack. Conda environments can't be shared. So each capability runs in its own process, and they talk over HTTP and WebSocket on localhost.
 
 What makes this different from a typical ROS graph is where the coordination lives. In ROS, multi-step tasks (navigate → detect → grasp) require an orchestration layer on top of the message bus. In Robot-OS, the routine executor is a Python state machine inside the FastAPI backend that dispatches steps sequentially: it sends a WebSocket message to the Jetson nav stack for navigation, makes an HTTP POST to the motion proxy for gestures, and calls the voice service API for speech — then waits for completion events before advancing. The state machine, the waiting logic, and the error handling are all in one file (`routine_executor.py`), not spread across a node graph.
 
@@ -40,9 +40,9 @@ The trade-off is real: swapping out the perception backend means changing HTTP e
 
 The one piece that uses ROS is the navigation stack, which runs ROS2 inside a Docker container on the Jetson. It's isolated because the ROS2 dependency tree is massive and because the nav stack was originally packaged that way. Nothing else in the system uses ROS.
 
-## The architecture
+### Two machines
 
-The system spans two machines. The Jetson inside the robot handles sensor relay and navigation. A workstation across the room handles everything else: the web frontend, the backend services, perception inference, voice processing, and policy execution. They communicate over WiFi.
+These ten processes all run on the workstation. But the system spans two machines: the workstation across the room, and the Jetson Orin NX mounted inside the robot. The Jetson handles sensor relay and navigation. The workstation handles everything else.
 
 This split exists for two reasons. First, the Jetson doesn't have the compute to run SAM3, FoundationPose, and a voice model simultaneously — those are GPU-hungry inference workloads that need a proper workstation GPU. Second, and more fundamentally, the robot's internal communication bus is unreachable from outside.
 
@@ -56,13 +56,13 @@ The obvious approach is IP forwarding: configure the Jetson as a gateway, route 
 
 ### Relay processes
 
-The solution is relay processes. Five small Python scripts run on the Jetson host (outside Docker), each bridging one data stream between the DDS bus and a WebSocket or HTTP endpoint the workstation can reach:
+The solution is relay processes. Five Python scripts run on the Jetson host (outside Docker), each bridging one data stream between the DDS bus and a WebSocket or HTTP endpoint the workstation can reach:
 
-- **Arm command relay** (port 8097): receives joint position targets from the workstation over WebSocket, publishes them to the `rt/arm_sdk` DDS topic at 250 Hz. This is the critical path for teleoperation and policy execution — any latency here means the robot's arm lags behind the commanded position.
+- **Arm command relay** (port 8097): receives joint position targets from the workstation over WebSocket, publishes them to the `rt/arm_sdk` DDS topic at 250 Hz. This is the most complex relay — a multi-threaded control loop with PD gain management, velocity limiting, gesture release logic, and a 300-second timeout-to-release mechanism. It's the critical path for teleoperation and policy execution, and the most safety-critical code in the system.
 
-- **Camera relay** (port 8090): captures RGB-D frames from the RealSense D435, JPEG-encodes RGB, base64-encodes depth, and streams both over WebSocket. The workstation's perception pipeline consumes these frames for object detection and pose estimation.
+- **Camera relay** (port 8090 on the Jetson): captures RGB-D frames from the RealSense D435, JPEG-encodes RGB, PNG-encodes depth (lossless uint16 to preserve precision), base64-wraps both, and streams them over WebSocket. The workstation's perception pipeline consumes these frames for object detection and pose estimation. (The spatial memory service also runs on port 8090, but on the workstation — different machines, same port number, a source of confusion I never bothered to fix.)
 
-- **Lowstate relay** (port 8096): reads the full joint state (35 motor positions, velocities, and torques) off the DDS bus via raw multicast, and forwards them at 30 Hz over WebSocket. This feeds the Rerun visualization (live URDF rendering) and provides the observation input for ACT policy inference.
+- **Lowstate relay** (port 8096): reads 29 joint positions off the DDS bus via raw multicast and forwards them at 30 Hz over WebSocket. This feeds the Rerun visualization (live URDF rendering) and provides the observation input for ACT policy inference.
 
 - **Velocity command executor** (port 9002, via nav stack): receives `cmd_vel` navigation commands from the ROS2 path follower inside the Docker container, and calls the Unitree SDK's `Move()` function to actually make the robot walk. Without this bridge, the navigation stack can plan paths but the robot won't move.
 
@@ -100,11 +100,18 @@ None of this is in the documentation. None of it is in the GitHub issues. Each d
 
 The perception pipeline detects objects in the camera feed, estimates their 3D pose, and stores them on the SLAM map. It runs as a chain of HTTP calls between four separate processes, each in its own conda environment.
 
-The backend captures an RGB-D frame from the camera relay and the robot's current pose from the navigation WebSocket, then POSTs both to the spatial memory service (port 8090). Spatial memory calls SAM3 (port 8091), which returns segmentation masks and coarse 3D meshes. Each mesh and the depth image are forwarded to FoundationPose (port 8093) for 6-DoF pose estimation. CLIP encodes each detection as a vector embedding for text search. The spatial memory service stores everything — object positions, orientations, meshes, embeddings — anchored to the robot's pose at detection time.
+The backend captures an RGB-D frame from the camera relay and the robot's current pose from the navigation WebSocket, then POSTs both to the spatial memory service (port 8090). From there:
 
-One detail that made this pipeline possible: SAM3's mesh output feeds directly into FoundationPose's input. Most FoundationPose workflows require pre-scanned CAD models of each object. Using SAM3's coarse reconstruction instead closes the loop from open-vocabulary detection to 6-DoF localization without knowing what the objects are in advance. I first used FoundationPose during an internship at VUB's BruBotics lab, and the realization that it could work with low-quality meshes was what made the whole spatial memory concept feasible.
+1. **SAM3** (port 8091) receives the RGB frame and returns segmentation masks and bounding boxes — 2D detection only.
+2. **SAM3D** (port 8092) takes each mask along with the depth image and reconstructs a coarse 3D mesh (`.obj`). This is the step that lifts detection from 2D to 3D.
+3. **FoundationPose** (port 8093) takes each mesh and estimates its 6-DoF pose in the robot's coordinate frame.
+4. **CLIP** encodes each detection as a vector embedding for text search.
 
-Getting FoundationPose to work within the resource constraints of a single workstation GPU was its own problem. The model wants to eat VRAM for breakfast. I ended up implementing sequential object processing with aggressive memory management — it takes longer per object, but it doesn't crash, and for a robot that processes a scene once before acting, latency per object matters less than robustness.
+The spatial memory service stores everything — object positions, orientations, meshes, embeddings — anchored to the robot's pose at detection time.
+
+Only one model runs on the GPU at a time. The spatial memory service explicitly unloads FoundationPose before running SAM3D, then unloads SAM3D before reloading FoundationPose. This two-pass orchestration means a single workstation GPU can handle the full pipeline without running out of VRAM — it just takes longer per object.
+
+The detail that made this pipeline feasible: SAM3D's coarse mesh reconstructions are good enough for FoundationPose. Most FoundationPose workflows require pre-scanned CAD models of each object. Using SAM3D's output instead closes the loop from open-vocabulary detection to 6-DoF localization without knowing what the objects are in advance. I first used FoundationPose during an internship at VUB's BruBotics lab, and the realization that it could work with low-quality meshes was what made the whole spatial memory concept possible.
 
 The pipeline has two unsolved problems:
 
@@ -124,7 +131,7 @@ Two WebSocket channels connect the nav stack to the workstation: one for visuali
 
 The integration between ROS2's path follower and Unitree's locomotion SDK was non-trivial. The navigation stack outputs `cmd_vel` velocity commands inside the Docker container, but the Unitree SDK can only be called from the Jetson host. The `cmdvel_ws_executor.py` bridge process connects to the container's WebSocket on port 9002, receives velocity commands, and translates them into SDK `Move()` calls. I debugged this chain for an entire weekend before realizing the executor was disabled by a single environment variable (`NAV_EXECUTOR_ENABLED=0`).
 
-The frontend lets you place waypoints on a 2D map, and the robot plans paths to them autonomously, including correct yaw orientation at the destination. The voice agent can also trigger navigation: "Go to the bottle" queries spatial memory for the bottle's position and sends it as a navigation goal.
+The frontend lets you place waypoints on a 2D map, and the robot plans paths to them autonomously, including correct yaw orientation at the destination. The voice agent can also trigger navigation: "Go to the bottle" queries spatial memory for the bottle's position and sends it as a navigation goal. An emergency stop flag in the navigation executor can block all movement instantly — the one safety mechanism I'm glad I never had to use in anger.
 
 Visualization bandwidth was a problem. The raw WebSocket broadcast from the nav stack was 6.5 MB per message at 1 Hz — mostly navigation graph and polygon markers that nobody needed. Disabling those fields dropped it to 941 KB at 4 Hz, which made the Rerun pointcloud visualization actually usable.
 
@@ -134,13 +141,15 @@ Visualization bandwidth was a problem. The raw WebSocket broadcast from the nav 
 
 A voice interface connects the robot to OpenAI's Realtime API for speech-to-speech conversation. The robot listens through a USB microphone on the workstation (the Jetson's audio hardware is limited), and the LLM generates both spoken responses and tool calls.
 
-Available tools include: navigate to a location, trigger a gesture, query spatial memory, and activate a manipulation skill. A routine executor can chain these into multi-step plans — "go to the kitchen, find the mug, pick it up" becomes a sequence of navigation goals, perception queries, and skill activations, orchestrated by a state machine that waits for each action to complete before advancing.
+Available tools include: navigate to a location, trigger a gesture, query spatial memory, capture and describe what the robot sees (the camera frame goes to GPT-4V, the description is spoken back), and activate a manipulation skill. "What do you see?" triggers the camera, runs vision analysis, and speaks the result — the robot has a visual perception loop accessible through natural language.
+
+A routine executor can chain these into multi-step plans — "go to the kitchen, find the mug, pick it up" becomes a sequence of navigation goals, perception queries, and skill activations, orchestrated by a state machine that waits for each action to complete before advancing.
 
 Single-step commands work reliably. Multi-step plans compound errors. If perception, navigation, and manipulation each succeed 85% of the time, a three-step chain succeeds 61% of the time. In practice, the rates are often lower. A navigation goal reached 30 cm off target means the subsequent grasp fails, and the planner doesn't know why.
 
 The bottleneck is not the language model. Current LLMs plan well enough for this kind of task. The bottleneck is the state representation they receive. The planner can only act on what the perception system actually detected, which may not reflect what's in the room.
 
-The hardest part of the voice system was not the language model. It was audio. ALSA device management on Linux, Bluetooth speaker pairing that silently breaks on reboot, microphone gain that clips in any environment louder than a library, echo cancellation between a speaker and a microphone mounted on the same robot. None of this is interesting. All of it has to work.
+The voice service itself has more infrastructure than you'd expect: a personality system with loadable configs (different system prompts, voices, and behaviors), conversation persistence across sessions, VAD via WebRTC for wake word detection, and a supervisor process that auto-restarts the voice runtime with exponential backoff if it crashes.
 
 ![Voice Interaction](voice-conversation.jpg)
 
@@ -158,7 +167,7 @@ After the IK solver, transforms, and scaling were all working correctly, the arm
 
 I spent twelve hours on this. I replaced the IK solver. Added feed-forward gravity compensation torques. Tuned PD gains. Restructured the coordinate pipeline. Every change was correct. None had any visible effect.
 
-The cause was a velocity clipper buried in the arm relay. The relay's control loop runs at 250 Hz. Each tick, the clipper read the motor's current position and capped how far the commanded position could deviate from it — 0.02 radians maximum. The intent was smooth motion. The effect was that the PD controller never saw more than a tiny position error, so it never generated more than a fraction of available torque. The arm couldn't overcome gravity because the relay was preventing it from trying.
+The cause was a velocity clipper buried in the arm relay. The relay's control loop runs at 250 Hz. Each tick, the clipper enforced a velocity limit of 5.0 rad/s — which at 250 Hz means the commanded position could move at most 0.02 radians per tick from the motor's current position. The intent was smooth motion. The effect was that the PD controller never saw more than a tiny position error, so it never generated more than a fraction of available torque. The arm couldn't overcome gravity because the relay was preventing it from trying.
 
 I removed the clipper. The arm lifted above the head on the first try.
 
