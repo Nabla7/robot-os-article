@@ -4,9 +4,9 @@
 
 ---
 
-You don't build a humanoid robot operating system because it's a good career move. You build it because you're standing in front of a machine with 29 degrees of freedom that can't do a single useful thing on its own, and you think: I can fix that.
+The Unitree G1 is a $16,000 humanoid robot with 29 degrees of freedom. Out of the box, it walks. It waves. It streams sensor data. What it cannot do is see objects, navigate to them, understand speech, or learn new tasks. The gap between a robot that balances and a robot that does useful work is enormous, and almost entirely a software problem.
 
-The Unitree G1 is a $16,000 humanoid robot. Out of the box, it walks. It waves. It streams sensor data. What it cannot do is see objects, navigate to them, understand speech, or learn new tasks. Between September 2025 and March 2026, I built the software that adds those capabilities — a full-stack system called Robot-OS that gives the G1 perception, navigation, voice interaction, and learned manipulation, coordinated through a single architecture running across two machines connected by WiFi.
+Between September 2025 and March 2026, I built Robot-OS — the software that bridges that gap. It gives the G1 perception, autonomous navigation, voice interaction, and learned manipulation, running across two machines connected by WiFi. 198 commits, roughly seven months of evenings and weekends, a lot of broken hardware.
 
 This is a description of that system: what it does, how the pieces fit together, and the parts that took longer than they should have.
 
@@ -18,13 +18,13 @@ The locomotion policy is good. I never had to touch it. Everything I built sits 
 
 ## Why not ROS?
 
-Most robotics labs build systems by stitching together ROS nodes — one for perception, one for navigation, one for planning — communicating through a publish-subscribe mesh. It's powerful and well-tested. It's also brittle in ways that matter when you're building a system that needs to coordinate voice, vision, navigation, and manipulation in real time.
+The standard approach in robotics is to build on ROS — one node per capability, communicating through publish-subscribe. It works. It's also where most of the debugging time goes. When perception publishes stale object positions and navigation plans a path to where the object was three seconds ago, every node is working correctly and the system still fails. The failure mode is in the interfaces, not the components.
 
-When something goes wrong in a ROS graph (and it always does), you're debugging message flows across a dozen processes with no central authority. A perception node publishes stale object positions. A navigation node plans a path to where the object was three seconds ago. A manipulation node reaches for empty space. Each node works. The system doesn't.
+Robot-OS uses a monolithic FastAPI backend instead. Every service — voice, vision, navigation, manipulation — lives under one process and shares state directly. When the perception pipeline updates an object's position, the navigation planner sees it immediately, not after serialization through a message queue. A single state machine can coordinate multi-step tasks (navigate, detect, grasp) without the orchestration layer that ROS systems typically need on top.
 
-I wanted a monolithic backend where every service lives under one process, shares state directly, and can be orchestrated through a single state machine. Not because monoliths are trendy, but because when your robot is about to walk into a wall, you need the navigation service to know about it *now*, not after a message round-trip through a serialization layer.
+The trade-off is obvious: less modularity, harder to swap components. In practice, for a system where everything is changing constantly and the integration *is* the hard part, having direct function calls between services saved more time than it cost.
 
-The one exception is the navigation stack itself, which runs ROS2 inside a Docker container on the Jetson. That's the only piece of the system that uses ROS, and it's isolated precisely because the ROS2 dependency tree is large enough to justify containment.
+The one exception is the navigation stack itself, which runs ROS2 inside a Docker container on the Jetson — the only piece of the system that uses ROS, isolated because the dependency tree is large enough to justify containment.
 
 ## The architecture
 
@@ -137,7 +137,7 @@ Single-step commands work reliably. Multi-step plans compound errors. If percept
 
 The bottleneck is not the language model. Current LLMs plan well enough for this kind of task. The bottleneck is the state representation they receive. The planner can only act on what the perception system actually detected, which may not reflect what's in the room.
 
-The hardest part of the voice system wasn't the AI. It was the audio infrastructure. ALSA device management on Linux, Bluetooth speaker pairing that breaks on reboot, microphone gain that clips in noisy environments, echo cancellation between the speaker and the mic — the unsexy engineering that makes voice interaction work in a physical space rather than a quiet demo room.
+The hardest part of the voice system was not the language model. It was audio. ALSA device management on Linux, Bluetooth speaker pairing that silently breaks on reboot, microphone gain that clips in any environment louder than a library, echo cancellation between a speaker and a microphone mounted on the same robot. None of this is interesting. All of it has to work.
 
 ![Voice Interaction](voice-conversation.jpg)
 
@@ -175,7 +175,7 @@ The Dex3 hands deserve a mention. They're mechanically capable but not designed 
 
 In the demo configuration, a user says "pick up the red mug." The voice agent queries spatial memory, retrieves the object's position, sends a navigation goal, waits for arrival, then activates the pick policy. Each step works individually. Chaining them reliably is the open problem.
 
-This isn't a surprising result. It's the expected state of a system where every component is early-stage and the interfaces between them are thin. What the system demonstrates is the structure: what layers a humanoid robot OS needs, how they connect, and where they break down.
+This isn't a surprising result. It's the expected state of a system where every component is early-stage and the interfaces between them are thin. What the system demonstrates is the structure: what layers a humanoid robot OS needs, how they connect, and where the failure modes live.
 
 ## Three things I'd change
 
@@ -187,4 +187,4 @@ This isn't a surprising result. It's the expected state of a system where every 
 
 ---
 
-*Pim Van den Bosch is a robotics engineer based in Belgium, working on humanoid robot systems, simulation, and whole-body control.*
+*Pim Van den Bosch — robotics, simulation, whole-body control. Based in Belgium.*
